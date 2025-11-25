@@ -40,7 +40,7 @@ def main():
             k=0.04,
             thresh_rel=0.01,
             nms_radius=4,
-            max_points=2000,
+            max_points=4000,
         )
         print(f"Image {idx}: detected {len(kps)} Harris corners.")
         kps, desc = build_patch_descriptors(gray, kps, patch_size=11)
@@ -52,11 +52,12 @@ def main():
     pairs = [(0, 1), (0, 2), (1, 2)]
     matches_dict = {}
     for i, j in pairs:
-        m = match_descriptors(descriptors[i], descriptors[j], ratio=0.75)
+        m = match_descriptors(descriptors[i], descriptors[j], ratio=0.8)
         print(f"Raw matches between {i}-{j}: {len(m)}")
         matches_dict[(i, j)] = m
 
     # ===== 4. 几何验证：对每一对图像做 RANSAC-F，删除外点 =====
+    ransac_thresh_px = 2.4  # Sampson 距离阈值（像素级），略放宽以提高召回
     F_dict = {}
     inliers_dict = {}
     matches_inliers_dict = {}
@@ -70,7 +71,9 @@ def main():
         pts_i = np.array([keypoints[i][m[0]] for m in matches_ij], dtype=np.float64)
         pts_j = np.array([keypoints[j][m[1]] for m in matches_ij], dtype=np.float64)
 
-        F_ij, inliers_ij = ransac_fundamental(pts_i, pts_j, num_iters=2000, thresh=1e-3)
+        F_ij, inliers_ij = ransac_fundamental(
+            pts_i, pts_j, num_iters=4000, thresh=ransac_thresh_px
+        )
         F_dict[(i, j)] = F_ij
         inliers_dict[(i, j)] = inliers_ij
 
@@ -283,7 +286,7 @@ def main():
                            dtype=np.float64)
 
         F02, inliers02 = ransac_fundamental(
-            pts0_02, pts2_02, num_iters=2000, thresh=1e-3
+            pts_i, pts_j, num_iters=2000, thresh=ransac_thresh_px
         )
         print("Fallback F02 (0-2):\n", F02)
         pts0_02_in = pts0_02[inliers02]

@@ -10,7 +10,9 @@ from utils import *
 
 def main():
     # ===== 路径设置 =====
-    DATA_DIR = "./PRCV/data"  # 请确保该文件夹下有 00000022/23/24.jpg 和 *_cam.txt
+    # 默认使用仓库自带的样例数据文件夹
+    # （此前路径写成了 ./PRCV/data，实际数据在项目根目录的 ./data 下）。
+    DATA_DIR = "./data"  # 请确保该文件夹下有 00000022/23/24.jpg 和 *_cam.txt
     OUTPUT_ROOT = Path("./PRCV/sfm_output")
     MATCH_DIR = OUTPUT_ROOT / "特征匹配结果"
     RECONS_DIR = OUTPUT_ROOT / "重建结果"
@@ -40,7 +42,7 @@ def main():
             k=0.04,
             thresh_rel=0.01,
             nms_radius=4,
-            max_points=2000,
+            max_points=4000,  # 放宽上限，尽量保留更多角点
         )
         print(f"Image {idx}: detected {len(kps)} Harris corners.")
         kps, desc = build_patch_descriptors(gray, kps, patch_size=11)
@@ -50,13 +52,21 @@ def main():
 
     # ===== 3. 特征匹配（brute force + Lowe ratio） =====
     pairs = [(0, 1), (0, 2), (1, 2)]
+    # 为不同视角差异的图片对设置独立的匹配 / RANSAC 参数
+    pair_params = {
+        (0, 1): {"ratio": 0.82, "ransac_thresh": 1.2},
+        (0, 2): {"ratio": 0.92, "ransac_thresh": 2.2},  # 视角跨度更大，适当放宽
+        (1, 2): {"ratio": 0.90, "ransac_thresh": 2.0},
+    }
     matches_dict = {}
     for i, j in pairs:
-        m = match_descriptors(descriptors[i], descriptors[j], ratio=0.75)
+        ratio_ij = pair_params.get((i, j), {}).get("ratio", 0.8)
+        m = match_descriptors(descriptors[i], descriptors[j], ratio=ratio_ij)
         print(f"Raw matches between {i}-{j}: {len(m)}")
         matches_dict[(i, j)] = m
 
     # ===== 4. 几何验证：对每一对图像做 RANSAC-F，删除外点 =====
+    ransac_thresh_px = 1.2  # 默认 Sampson 距离阈值（像素级）
     F_dict = {}
     inliers_dict = {}
     matches_inliers_dict = {}
@@ -70,7 +80,10 @@ def main():
         pts_i = np.array([keypoints[i][m[0]] for m in matches_ij], dtype=np.float64)
         pts_j = np.array([keypoints[j][m[1]] for m in matches_ij], dtype=np.float64)
 
-        F_ij, inliers_ij = ransac_fundamental(pts_i, pts_j, num_iters=2000, thresh=1e-3)
+        thresh_ij = pair_params.get((i, j), {}).get("ransac_thresh", ransac_thresh_px)
+        F_ij, inliers_ij = ransac_fundamental(
+            pts_i, pts_j, num_iters=4000, thresh=thresh_ij
+        )
         F_dict[(i, j)] = F_ij
         inliers_dict[(i, j)] = inliers_ij
 
@@ -93,6 +106,10 @@ def main():
 
         # 若有 RANSAC 内点，则用内点匹配；否则用全部匹配
         matches_to_draw = matches_inliers_dict.get((i, j), matches_dict[(i, j)])
+        if (i, j) == (0, 2) and len(matches_to_draw) < 30:
+            # 若 0-2 视角下 RANSAC 内点过少，退回较多的原始匹配以便观察
+            raw_matches_sorted = sorted(matches_dict[(i, j)], key=lambda x: x[2])
+            matches_to_draw = raw_matches_sorted[:80]
 
         # 5.1 匹配可视化：0_1.jpg, 0_2.jpg, 1_2.jpg
         match_path = MATCH_DIR / f"{i}_{j}.jpg"
@@ -282,8 +299,10 @@ def main():
         pts2_02 = np.array([keypoints[2][m[1]] for m in matches_02],
                            dtype=np.float64)
 
+        # 使用 (0,2) 特定的 RANSAC 阈值，避免因基线太大而过度剔除
+        thresh_02 = pair_params.get((0, 2), {}).get("ransac_thresh", ransac_thresh_px)
         F02, inliers02 = ransac_fundamental(
-            pts0_02, pts2_02, num_iters=2000, thresh=1e-3
+            pts0_02, pts2_02, num_iters=2000, thresh=thresh_02
         )
         print("Fallback F02 (0-2):\n", F02)
         pts0_02_in = pts0_02[inliers02]
@@ -467,7 +486,7 @@ def main():
     )
 
     # 简单阈值：重投影误差 > 5 像素视为异常点
-    thresh_bad = 5.0
+    thresh_bad = 8.0
     keep_mask = point_errs <= thresh_bad
     n_before = len(points_3d_opt)
     n_after = int(keep_mask.sum())

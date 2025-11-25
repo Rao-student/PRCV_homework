@@ -127,20 +127,43 @@ def match_descriptors(desc1, desc2, ratio=0.75):
 
 # ===================== 几何：F, E, 分解，三角化 =====================
 
-def eight_point_fundamental(pts1, pts2):
+def _hartley_normalization(pts):
+    """Hartley 归一化：让点的均值在原点，平均距离为 sqrt(2)。"""
+    pts = np.asarray(pts, dtype=np.float64)
+    mean = pts.mean(axis=0)
+    pts_centered = pts - mean
+    dist = np.sqrt(np.sum(pts_centered ** 2, axis=1))
+    scale = np.sqrt(2) / (dist.mean() + 1e-12)
+
+    T = np.array([
+        [scale, 0, -scale * mean[0]],
+        [0, scale, -scale * mean[1]],
+        [0, 0, 1],
+    ], dtype=np.float64)
+
+    pts_h = np.hstack([pts, np.ones((pts.shape[0], 1))]).T
+    pts_norm_h = T @ pts_h
+    pts_norm = (pts_norm_h[:2, :] / pts_norm_h[2, :]).T
+    return pts_norm, T
+
+
+def eight_point_fundamental_normalized(pts1, pts2):
     """
-    简单 8 点法估计 F，不做坐标归一化（作业可以再自己加归一化版本）。
+    采用 Hartley 归一化的 8 点法估计 F，提升数值稳定性。
     pts1, pts2: (N,2) 像素坐标
-    返回：F (3x3)，满足 x2.T F x1 ≈ 0
+    返回：去归一化后的 F (3x3)，满足 x2.T F x1 ≈ 0
     """
     N = pts1.shape[0]
     if N < 8:
         raise ValueError("Need at least 8 points for 8-point algorithm")
 
-    x1 = pts1[:, 0]
-    y1 = pts1[:, 1]
-    x2 = pts2[:, 0]
-    y2 = pts2[:, 1]
+    pts1_norm, T1 = _hartley_normalization(pts1)
+    pts2_norm, T2 = _hartley_normalization(pts2)
+
+    x1 = pts1_norm[:, 0]
+    y1 = pts1_norm[:, 1]
+    x2 = pts2_norm[:, 0]
+    y2 = pts2_norm[:, 1]
 
     A = np.zeros((N, 9), dtype=np.float64)
     A[:, 0] = x2 * x1
@@ -153,14 +176,15 @@ def eight_point_fundamental(pts1, pts2):
     A[:, 7] = y1
     A[:, 8] = 1.0
 
-    # SVD(A) -> 最小奇异值对应的右奇异向量
     _, _, Vt = np.linalg.svd(A)
-    F = Vt[-1].reshape(3, 3)
+    F_norm = Vt[-1].reshape(3, 3)
 
-    # 施加 rank-2 约束
-    U, S, Vt = np.linalg.svd(F)
+    U, S, Vt = np.linalg.svd(F_norm)
     S[2] = 0.0
-    F = U @ np.diag(S) @ Vt
+    F_norm = U @ np.diag(S) @ Vt
+
+    # 去归一化：F = T2^T * F_norm * T1
+    F = T2.T @ F_norm @ T1
     return F
 
 
@@ -183,9 +207,10 @@ def sampson_error(F, pts1, pts2):
     return num / denom
 
 
-def ransac_fundamental(pts1, pts2, num_iters=2000, thresh=1e-3):
+def ransac_fundamental(pts1, pts2, num_iters=4000, thresh=0.5):
     """
-    自己实现 RANSAC 估计 F。
+    RANSAC 估计 F，内部使用 Hartley 归一化的 8 点法并在像素坐标中计算
+    Sampson 误差。默认阈值 0.5 像素，能更好地兼顾召回与精度。
     返回：F_best, inlier_mask (N,)
     """
     N = pts1.shape[0]
@@ -200,7 +225,9 @@ def ransac_fundamental(pts1, pts2, num_iters=2000, thresh=1e-3):
 
     for _ in range(num_iters):
         sample_ids = rng.choice(N, size=8, replace=False)
-        F_candidate = eight_point_fundamental(pts1[sample_ids], pts2[sample_ids])
+        F_candidate = eight_point_fundamental_normalized(
+            pts1[sample_ids], pts2[sample_ids]
+        )
 
         errs = sampson_error(F_candidate, pts1, pts2)
         inlier_mask = errs < thresh
@@ -212,7 +239,7 @@ def ransac_fundamental(pts1, pts2, num_iters=2000, thresh=1e-3):
             best_inliers = inlier_mask
 
     # 用内点重新估计一次 F
-    F_refined = eight_point_fundamental(pts1[best_inliers], pts2[best_inliers])
+    F_refined = eight_point_fundamental_normalized(pts1[best_inliers], pts2[best_inliers])
     return F_refined, best_inliers
 
 
@@ -359,10 +386,22 @@ def pnp_nonlinear(X_world, x_pix, K):
     """
     X_world = np.asarray(X_world, dtype=np.float64)
     x_pix = np.asarray(x_pix, dtype=np.float64)
+    assert len(X_world) == len(x_pix)
 
-    # 初始猜测：小旋转 + 平移 [0,0,1]
+    # 初始猜测：优先使用 EPnP 结果，再做非线性细化
     x0 = np.zeros(6, dtype=np.float64)
-    x0[5] = 1.0
+    success, rvec_pnp, tvec_pnp = cv2.solvePnP(
+        X_world,
+        x_pix,
+        K,
+        None,
+        flags=cv2.SOLVEPNP_EPNP,
+    )
+    if success:
+        x0[:3] = rvec_pnp.reshape(-1)
+        x0[3:] = tvec_pnp.reshape(-1)
+    else:
+        x0[5] = 1.0
 
     def residuals(params):
         rvec = params[:3]
@@ -448,7 +487,7 @@ def bundle_adjustment(points_3d,
     print("Running bundle adjustment ...")
     res = optimize.least_squares(
         ba_residuals, x0, method="lm",
-        max_nfev=200, verbose=2
+        max_nfev=800, verbose=2
     )
 
     params_opt = res.x
